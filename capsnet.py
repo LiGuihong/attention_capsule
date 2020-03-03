@@ -55,7 +55,7 @@ class DataLoader:
         self.test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True)        
 
 class ConvLayer(nn.Module):
-    def __init__(self, in_channels=3, out_channels=256, kernel_size=9):
+    def __init__(self, in_channels=3, out_channels=64, kernel_size=9):
         super(ConvLayer, self).__init__()
         
         self.conv = nn.Conv2d(in_channels=in_channels,
@@ -78,7 +78,7 @@ class ConvLayer(nn.Module):
         self.writer = writer
 
 class PrimaryCaps(nn.Module):
-    def __init__(self, num_capsules=64, in_channels=256, out_channels=8, kernel_size=9):
+    def __init__(self, num_capsules=64, in_channels=64, out_channels=8, kernel_size=9):
         super(PrimaryCaps, self).__init__()
         self.num_capsules = num_capsules
         self.capsules = nn.ModuleList([
@@ -116,6 +116,91 @@ class PrimaryCaps(nn.Module):
             return u.permute(0,2,3,4,1).reshape(1,8,8,-1).permute(3,0,1,2)
         else:
             return u.permute(0,2,3,4,1).reshape(1,6,6,-1).permute(3,0,1,2)
+
+
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+class residual_mod(nn.Module):
+    expansion = 1
+    __constants__ = ['downsample']
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None):
+        super(residual_mod, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError('residual_mod only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in residual_mod")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        #if self.downsample is not None:
+        #    identity = self.downsample(x)
+        #print(out.size())
+        #print(identity.size())
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+class mask_branch(nn.Module):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None):
+        super(mask_branch, self).__init__()
+        self.max_pool0=torch.nn.MaxPool2d(2, stride=None, padding=0, dilation=1, return_indices=False, ceil_mode=False)
+        self.res0=residual_mod(inplanes,inplanes)
+        self.max_pool1=torch.nn.MaxPool2d(2, stride=None, padding=0, dilation=1, return_indices=False, ceil_mode=False)
+        self.res1=residual_mod(inplanes,inplanes)
+        self.res2=residual_mod(inplanes,inplanes)
+        self.res3=residual_mod(inplanes,inplanes)
+        self.res4=residual_mod(inplanes,inplanes)
+        self.conv_1by1_0=conv1x1(inplanes,planes*2)
+        self.conv_1by1_1=conv1x1(planes*2,planes)
+        self.act_func=nn.Sigmoid()
+    #self.act=nn.Sigmoid()
+    def forward(self,x):
+        out=self.max_pool0(x)
+        out=self.res0(out)
+        out1=self.max_pool1(out)
+        out2=self.res3(out)
+        out1=self.res1(out1)
+        out1=self.res2(out1)
+        #print(out2.size())
+        out1=nn.functional.interpolate(out1, size=[12, 12], mode='nearest')
+        #print(out1.size())
+        out=out1+out2
+        out=self.res4(out)
+        out=nn.functional.interpolate(out1, size=[512,8], mode='bilinear')
+        out=self.conv_1by1_0(out)
+        out=self.conv_1by1_1(out)
+        out=self.act_func(out)
+        return out
 
 class DigitCaps(nn.Module):
     def __init__(self, num_capsules=10, num_routes=64 * 8 * 8, in_channels=8, out_channels=16):
@@ -234,6 +319,7 @@ class CapsNet(nn.Module):
         super(CapsNet, self).__init__()
         self.conv_layer = ConvLayer(in_channels = 1 if args.dataset == 'mnist' or args.dataset == 'f-mnist' else 3)
         self.primary_capsules = PrimaryCaps(num_capsules = args.num_capsules)
+        self.attention=mask_branch(64,8)
         if args.dataset == 'mnist' or args.dataset == 'f-mnist':
             self.digit_capsules = DigitCaps(num_routes = 32 * 6 * 6)
         elif args.dataset == 'svhn':
@@ -245,7 +331,14 @@ class CapsNet(nn.Module):
         self.mse_loss = nn.MSELoss()
         
     def forward(self, data):
-        output = self.digit_capsules(self.primary_capsules(self.conv_layer(data)))
+        raw=self.conv_layer(data)
+        out=self.primary_capsules(raw)
+        raw2=self.attention(raw)
+        raw2=raw2.view(args.batch_size,-1,8)
+        #print(out.size())
+        #print(raw2.size())
+        out=out*(1+raw2)
+        output = self.digit_capsules(out)
         masked = self.decoder(output, data)
         return output, masked
     
